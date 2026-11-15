@@ -9,10 +9,14 @@
   if (!DATA) return;
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', chain: 'all', wl: false, conf: 0, tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
-  var sandbox = { growth: DATA.model.growth_weight, maturity: DATA.model.maturity_range };
+  var sandbox = { growth: DATA.model.growth_weight, maturity: DATA.model.maturity_range, plain: false };
   var sandboxOn = false;
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+  function fmtExact(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return usd.format(n);
+  }
   function fmtUsd(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
@@ -42,7 +46,21 @@
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * mr;
     return Math.max(1, Math.round(row.tvl_usd * row.multiple * growthMult * maturity * row.reach_multiplier));
   }
-  function shownImplied(row) { return sandboxOn ? impliedOf(row, DATA.model, sandbox) : row.implied_value_usd; }
+  function shownImplied(row) {
+    if (sandbox.plain) return row.implied_plain_usd;
+    return sandboxOn ? impliedOf(row, DATA.model, sandbox) : row.implied_value_usd;
+  }
+  // The plain rank: a row's rank by the plain implied value (no growth, no
+  // reach), computed once from the board's own figures.
+  var plainRank = (function () {
+    var order = DATA.rows.slice().sort(function (a, b) {
+      if (b.implied_plain_usd !== a.implied_plain_usd) return b.implied_plain_usd - a.implied_plain_usd;
+      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+    });
+    var map = {};
+    order.forEach(function (r, i) { map[r.slug] = i + 1; });
+    return map;
+  })();
 
   function el(tag, attrs) {
     var node = document.createElement(tag);
@@ -204,7 +222,7 @@
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
-        el('p', { html: 'The watchlist is the floor: every protocol with at least <b>$' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL</b> and no token on record. The early radar adds <b>' + DATA.early_size + ' pre-token protocols</b> below that floor. Implied value is a model calibrated on live-token comparables, not a promise.' })
+        el('p', { html: 'The watchlist is the floor: every protocol with at least <b>$' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL</b> and no token on record. The early radar adds <b>' + DATA.early_size + ' pre-token protocols</b> below that floor. All <b>' + DATA.watchlist_size + ' of ' + DATA.watchlist_size + ' watchlist protocols appear below</b> — filter "Watchlist only" to see just them — each with its state shown even where the snapshot reports no growth or age. Implied value is a model calibrated on live-token comparables, not a promise.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { html: DATA.watchlist_size + ' / ' + DATA.watchlist_size + ' <em>all</em>' })),
@@ -247,7 +265,7 @@
       el('div', { class: 'field' }, el('label', { for: 'conf', text: 'Confidence' }), confSel),
       el('label', { class: 'field check', for: 'wl' }, wlBox, 'Watchlist only'),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
-      el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' + (sandboxOn ? ' (sandbox ranking)' : '') : DATA.live.length + ' live-token protocols' })
+      el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' + (state.wl ? ' (all ' + DATA.watchlist_size + ' watchlist rows)' : '') + (sandbox.plain ? ' (plain ranking: no growth, no reach)' : sandboxOn ? ' (sandbox ranking)' : '') : DATA.live.length + ' live-token protocols' })
     );
   }
 
@@ -276,28 +294,41 @@
     list.forEach(function (r, i) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
+      // A rank band: when a row's shown value sits within 2% of its neighbour
+      // in this listing, the two are effectively tied and the rank says so.
+      var near = false;
+      if (i > 0) near = near || Math.abs(shownImplied(list[i - 1]) - shownImplied(r)) / Math.max(1, shownImplied(r)) <= 0.02;
+      if (i < list.length - 1) near = near || Math.abs(shownImplied(list[i + 1]) - shownImplied(r)) / Math.max(1, shownImplied(r)) <= 0.02;
+      var rankCell = el('td', { class: 'num', text: String(sandboxOn || sandbox.plain ? i + 1 : r.rank) });
+      if (near) rankCell.appendChild(el('span', { class: 'approx', title: 'Within 2% of its neighbour: effectively tied on value.', text: ' ~' }));
       var badge = r.on_watchlist
         ? el('span', { class: 'status watch', text: 'watchlist' })
         : (r.flags && r.flags.length ? el('span', { class: 'status warn', text: 'caution' }) : el('span', { class: 'status', text: 'early' }));
+      var impliedCell = el('td', null,
+        el('div', { class: 'implied' },
+          el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((shownImplied(r) / max) * 100)) + '%' })),
+          el('span', { class: 'num', text: fmtUsd(shownImplied(r)) }),
+          r.weak_proxy ? el('span', { class: 'warnmark', title: 'TVL is mostly client capital under management or advice: a future token would capture fee share, not the TVL itself.', text: '!' }) : null
+        ),
+        el('div', { class: 'cell-sub', text: 'base ' + fmtUsd(sandbox.plain ? r.implied_plain_usd : r.implied_base_usd) })
+      );
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
         onclick: function () { openDetail(r.slug); },
         onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
       },
-        el('td', { class: 'num', text: String(sandboxOn ? i + 1 : r.rank) }),
+        rankCell,
         el('td', null, el('div', { class: 'name' },
           el('b', { text: r.name }),
           el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
+        el('td', { class: 'num', text: String(r.multiple) + 'x' }, el('div', { class: 'cell-sub', text: 'n=' + r.comparables + ' · med ' + (r.category_median === null ? '—' : r.category_median.toFixed(2)) })),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
-        el('td', null, el('div', { class: 'implied' },
-          el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((shownImplied(r) / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(shownImplied(r)) })
-        )),
-        el('td', { class: 'num range', text: fmtUsd(r.implied_low_usd) + ' - ' + fmtUsd(r.implied_high_usd) }),
+        impliedCell,
+        el('td', { class: 'num range', text: fmtUsd(r.implied_low_usd) + ' - ' + fmtUsd(r.implied_high_usd) }, el('div', { class: 'cell-sub', text: 'n=' + r.comparables + ' comps' })),
         el('td', null, el('div', { class: 'conf' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { class: r.confidence < 70 ? 'low' : null, style: 'width:' + r.confidence + '%' })),
           el('span', { class: 'num', text: String(r.confidence) })
@@ -309,15 +340,16 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: sandboxOn ? 'Sandbox ranking: the board re-scored under your weights. Select a row for its model and farm plan.' : 'Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.' }),
+          el('caption', { class: 'sub', text: sandbox.plain ? 'Plain ranking: growth and reach removed, so rows order by TVL x multiple x maturity alone. Select a row for its model and farm plan.' : sandboxOn ? 'Sandbox ranking: the board re-scored under your weights. Select a row for its model and farm plan.' : 'Pre-token protocols, strongest implied value first. "Base" is the value with the 7-day growth adjustment removed. A ~ mark means the row sits within 2% of its neighbour: effectively tied. Select a row for its model and farm plan.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank', 'num'),
             sortHeader('name', 'Protocol'),
             sortHeader('tvl', 'TVL', 'num'),
-            sortHeader('growth', '7d', 'num'),
+            el('th', { scope: 'col', class: 'num', text: 'Multiple' }),
+            sortHeader('growth', '7d to ' + DATA.as_of, 'num'),
             sortHeader('age', 'Age', 'num'),
             sortHeader('implied', 'Implied value', 'num'),
-            el('th', { scope: 'col', class: 'num', text: 'Range' }),
+            el('th', { scope: 'col', class: 'num', text: 'Range (scenarios)' }),
             sortHeader('confidence', 'Conf.', 'num'),
             el('th', { scope: 'col', text: 'Tag' })
           )),
@@ -361,7 +393,16 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x reach )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Reach adds ' + m.reach_step + ' per extra chain, at most +' + m.reach_max_extra + '. The range re-runs the formula with the 25th and 75th percentile multiples, so a wide range says the comparables disagree. Confidence scores the evidence behind the row and never enters the value: a shaky row is flagged, not silently discounted.' })
+      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Reach adds ' + m.reach_step + ' per extra chain, at most +' + m.reach_max_extra + '. The range re-runs the formula with the 25th and 75th percentile multiples: it is a comparable-based scenario, not a confidence interval, so a wide range says the comparables disagree and claims no probability. Confidence scores the evidence behind the row and never enters the value: a shaky row is flagged, not silently discounted.' }),
+      el('h3', { text: 'Assumptions, stated plainly' }),
+      el('ul', { class: 'assumptions' },
+        el('li', { text: 'Shrinkage prior +' + m.shrink_k + ': a category with ' + m.shrink_k + ' comparables is weighted equally with the global median, so thin categories stay near the global price. The number is a judgment call about how much to trust small samples.' }),
+        el('li', { text: 'Multiple clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + '], ratios winsorized to [0.005, 2.0]: one wild protocol must not set its whole category\'s price or let a multiple run away.' }),
+        el('li', { text: 'Growth weight ' + m.growth_weight + ', clamped to [' + m.growth_floor + ', ' + m.growth_cap + ']%: the seven-day adjustment is short-term and noisy — one week of flows is weak evidence about a token launch — so it is halved and capped. Each row shows its no-growth base value beside the adjusted one.' }),
+        el('li', { text: 'Maturity ' + m.maturity_floor + ' to ' + (m.maturity_floor + m.maturity_range) + ' over ' + m.maturity_days + ' days: a protocol that has run longer with no token has more staying power, but the effect is capped because age alone creates no value.' }),
+        el('li', { text: 'Reach +' + m.reach_step + ' per extra chain, at most +' + m.reach_max_extra + ': distribution across chains is worth something, but little — it is a tiebreaker, not a driver.' }),
+        el('li', { text: 'None of these constants is validated: the snapshot carries no outcome data (no past launches to test against), so they are stated choices, not fitted ones. Move them in the sandbox and watch the ranks move.' })
+      )
     );
   }
 
@@ -373,7 +414,9 @@
     var mOut = el('output', { text: sandbox.maturity.toFixed(2) });
     var mIn = el('input', { type: 'range', min: '0', max: '0.8', step: '0.05', value: String(sandbox.maturity), 'aria-label': 'Maturity range' });
     mIn.addEventListener('input', function () { sandbox.maturity = parseFloat(mIn.value); mOut.textContent = sandbox.maturity.toFixed(2); applySandbox(); });
-    var reset = el('button', { class: 'button ghost', type: 'button', text: 'Reset to the board model', onclick: function () { sandbox.growth = m.growth_weight; sandbox.maturity = m.maturity_range; sandboxOn = false; render(); } });
+    var reset = el('button', { class: 'button ghost', type: 'button', text: 'Reset to the board model', onclick: function () { sandbox.growth = m.growth_weight; sandbox.maturity = m.maturity_range; sandbox.plain = false; sandboxOn = false; render(); } });
+    var plainBox = el('input', { type: 'checkbox', id: 'plain', checked: sandbox.plain ? 'checked' : null });
+    plainBox.addEventListener('change', function () { sandbox.plain = plainBox.checked; applySandbox(); });
     return el('section', { class: 'panel sandbox' },
       el('h2', { text: 'Model sandbox' }),
       el('p', { class: 'sub', text: 'Change the weights and the board re-ranks at once, under your model. The board file keeps the base model; the sandbox only re-scores what you see.' }),
@@ -381,8 +424,9 @@
         el('div', { class: 'slider' }, el('label', null, el('span', { text: 'Growth weight (base ' + m.growth_weight + ')' }), gOut), gIn),
         el('div', { class: 'slider' }, el('label', null, el('span', { text: 'Maturity range (base ' + m.maturity_range + ')' }), mOut), mIn)
       ),
+      el('label', { class: 'field check plain-check', for: 'plain' }, plainBox, 'Rank without growth and reach adjustments (plain ranking: TVL x multiple x maturity)'),
       reset,
-      el('p', { class: 'note', text: sandboxOn ? 'Sandbox ranking is live: ranks and implied values below follow your weights.' : 'Move a slider to re-rank the board under your own weights.' })
+      el('p', { class: 'note', text: sandbox.plain ? 'Plain ranking is live: ranks follow TVL x multiple x maturity, and the sliders are ignored. Each detail view shows the row\'s rank under the base model and under the plain ranking side by side.' : sandboxOn ? 'Sandbox ranking is live: ranks and implied values below follow your weights.' : 'Move a slider to re-rank the board under your own weights, or tick the plain ranking to see what the growth and reach adjustments are doing.' })
     );
   }
   function applySandbox() {
@@ -407,24 +451,29 @@
       : 'The page recomputes this row as ' + fmtUsd(recomputed) + ', which differs from the board: the data would be stale.';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.on_watchlist ? ' - watchlist' : ' - early find') }),
+        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.on_watchlist ? ' - watchlist' : ' - early find') + ' · plain rank ' + plainRank[row.slug] + ' (no growth, no reach)' }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
+    if (row.weak_proxy) {
+      dialog.appendChild(el('div', { class: 'proxywarn', text: 'TVL is a weak proxy here: this protocol mostly holds or advises on client capital, so a future token would capture fee share, not the TVL itself. Treat the implied value below as an upper bound.' }));
+    }
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: String(row.multiple) + ' (' + row.comparables + (row.comparables === 1 ? ' comp)' : ' comps)') })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
+        el('div', null, el('span', { text: 'TVL used' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
+        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: String(row.multiple) + 'x (' + row.comparables + (row.comparables === 1 ? ' comp' : ' comps') + ', med ' + (row.category_median === null ? '—' : row.category_median.toFixed(2)) + ')' })),
+        el('div', null, el('span', { text: 'Seven-day growth (to ' + DATA.as_of + ')' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth x maturity x reach' }), el('b', { class: 'num', text: String(row.growth_multiplier) + ' x ' + String(row.maturity_multiplier) + ' x ' + String(row.reach_multiplier) })),
         el('div', null, el('span', { text: 'Confidence' }), el('b', { class: 'num', text: String(row.confidence) + ' / 100' })),
-        el('div', { class: 'wide' }, el('span', { text: 'Implied value (range from the comparables)' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) + '  -  ' + fmtUsd(row.implied_low_usd) + ' to ' + fmtUsd(row.implied_high_usd) }))
+        el('div', null, el('span', { text: 'Base value (no growth)' }), el('b', { class: 'num', text: fmtUsd(row.implied_base_usd) })),
+        el('div', null, el('span', { text: 'Plain value (no growth, no reach)' }), el('b', { class: 'num', text: fmtUsd(row.implied_plain_usd) })),
+        el('div', { class: 'wide' }, el('span', { text: 'Implied value (comparable scenarios, n=' + row.comparables + ')' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) + '  -  ' + fmtUsd(row.implied_low_usd) + ' to ' + fmtUsd(row.implied_high_usd) }), el('span', { class: 'exact', text: 'Exact: ' + fmtExact(row.implied_value_usd) + ' (scenarios ' + fmtExact(row.implied_low_usd) + ' to ' + fmtExact(row.implied_high_usd) + ')' }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. ' + verify + ' This is an estimate, not a price. It says what a token would be worth if the record stayed as it is; it does not say a token is coming.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. ' + verify + ' The 7-day adjustment is short-term and noisy: one week of flows is weak evidence about a token launch, which is why the base value sits beside the adjusted one. This is an estimate, not a price. It says what a token would be worth if the record stayed as it is; it does not say a token is coming.' })
     ));
     var flagList = (row.flags && row.flags.length)
       ? el('ul', { class: 'flags' }, row.flags.map(function (f) { return el('li', { text: f }); }))
@@ -440,7 +489,8 @@
         var action = at >= 0 ? s.slice(0, at) : s;
         var tail = at >= 0 ? s.slice(at + 1) : '';
         return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
-      }))
+      })),
+      el('p', { class: 'sub', text: 'Estimation basis: the capital comes from the protocol\'s TVL band ($50-$250), the gas from its first chain\'s tier (Ethereum dear, fast chains near-free), and the hold window from its age (30-60 days). Costs and times are estimates from those rules, not quotes.' })
     ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();

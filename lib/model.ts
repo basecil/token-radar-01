@@ -30,12 +30,29 @@
 //
 // Uncertainty is shown, never hidden. The implied range re-runs the same
 // formula with the category's 25th and 75th percentile multiples (shrunk the
-// same way), so a wide range says the comparables disagree. Confidence
-// (0-100) scores the evidence behind the row: missing growth or age, thin
-// comparables, a spike or crash week, and a short track record each cost
-// points, and each deduction is named as a flag. Confidence never enters the
-// implied value: a shaky row is flagged, not silently discounted, and a
-// popular row never cancels its own hazards.
+// same way), so a wide range says the comparables disagree. It is a
+// comparable-based scenario, never a confidence interval: no probability is
+// claimed. Confidence (0-100) scores the evidence behind the row: missing
+// growth or age, thin comparables, a spike or crash week, and a short track
+// record each cost points, and each deduction is named as a flag. Confidence
+// never enters the implied value: a shaky row is flagged, not silently
+// discounted, and a popular row never cancels its own hazards.
+//
+// Two more values travel with every row so the reader can see what the
+// adjustments do: the base implied value (the growth multiplier removed) and
+// the plain implied value (growth and reach both removed). The board ranks
+// by the adjusted value; the detail view shows all three, and the sandbox
+// can rank by the plain one.
+//
+// TVL is a weak proxy for some rows. Curators, allocators, risk managers and
+// index providers mostly hold or advise on client capital: a future token
+// would capture a share of fees, not the TVL itself. Those rows are flagged
+// (weak_proxy) and their implied value is an upper bound, stated as one.
+// The flag is a warning, not a discount: the snapshot carries no fee data,
+// so no evidence-based discount exists, and the model does not invent one.
+// Splitting the calibration by group was considered and rejected: the live
+// comparables for the service group are 1-3 protocols, so a separate
+// multiple would rest the top of the board on one or two ratios.
 //
 // No protocol name is ever special-cased: the same functions score every row.
 
@@ -125,10 +142,13 @@ export interface BoardRow {
   symbol: string | null;
   token_status: 'pre-token';
   on_watchlist: boolean;
+  weak_proxy: boolean;
   age_days: number | null;
   implied_value_usd: number;
   implied_low_usd: number;
   implied_high_usd: number;
+  implied_base_usd: number;
+  implied_plain_usd: number;
   confidence: number;
   flags: string[];
   model: {
@@ -157,9 +177,12 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   on_watchlist: boolean;
+  weak_proxy: boolean;
   implied_value_usd: number;
   implied_low_usd: number;
   implied_high_usd: number;
+  implied_base_usd: number;
+  implied_plain_usd: number;
   confidence: number;
   flags: string[];
   multiple: number;
@@ -291,12 +314,15 @@ export function categoryMultiple(
   category: string | null,
   comps: Comparables,
   model: ModelConstants,
-): { multiple: number; low: number; high: number; median: number | null; n: number } {
+): { multiple: number; low: number; high: number; median: number | null; n: number; spread: number | null } {
   const list = category === null ? undefined : comps.byCategory.get(category);
   const n = list === undefined ? 0 : list.length;
   const median = list === undefined ? null : medianOf(list);
   const p25 = list === undefined ? null : percentileOf(list, 0.25);
   const p75 = list === undefined ? null : percentileOf(list, 0.75);
+  // How far the category's own comparables disagree (n>=3 only): a wide
+  // spread says the peer set is mixed, whatever the shrunk range says.
+  const spread = list !== undefined && n >= 3 && p25 !== null && p75 !== null && p25 > 0 ? p75 / p25 : null;
   const multiple = Math.min(
     model.multiple_cap,
     Math.max(model.multiple_floor, shrunk(median, comps.globalMedian, n, model.shrink_k)),
@@ -309,7 +335,13 @@ export function categoryMultiple(
     model.range_cap,
     Math.max(model.range_floor, shrunk(p75, comps.globalHigh, n, model.shrink_k)),
   );
-  return { multiple, low, high, median, n };
+  return { multiple, low, high, median, n, spread };
+}
+
+/** Whether the protocol's TVL is mostly client capital under management or advice. */
+export function isWeakProxy(p: SnapshotProtocol): boolean {
+  const c = (p.category ?? '').toLowerCase();
+  return c.includes('curator') || c.includes('allocator') || c.includes('risk') || c.includes('indexes');
 }
 
 /** The full scoring of one protocol: implied value, range, confidence and flags. */
@@ -322,6 +354,8 @@ export function scoreProtocol(
   implied: number;
   low: number;
   high: number;
+  base: number;
+  plain: number;
   confidence: number;
   flags: string[];
   multiple: number;
@@ -334,7 +368,7 @@ export function scoreProtocol(
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const { multiple, low: lowMult, high: highMult, median, n } = categoryMultiple(protocol.category, comps, model);
+  const { multiple, low: lowMult, high: highMult, median, n, spread } = categoryMultiple(protocol.category, comps, model);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -348,6 +382,10 @@ export function scoreProtocol(
   const implied = Math.max(1, Math.round(base * multiple * growthMult * maturityMult * reachMult));
   const low = Math.max(1, Math.round(base * lowMult * growthMult * maturityMult * reachMult));
   const high = Math.max(implied, Math.round(base * highMult * growthMult * maturityMult * reachMult));
+  // The same value with the short-term adjustments removed, so the reader can
+  // see what they do: base drops growth, plain drops growth and reach.
+  const baseImplied = Math.max(1, Math.round(base * multiple * maturityMult * reachMult));
+  const plainImplied = Math.max(1, Math.round(base * multiple * maturityMult));
 
   // Confidence scores the evidence, never the value: each gap is named, not hidden.
   let confidence = 100;
@@ -373,8 +411,16 @@ export function scoreProtocol(
   if (n < 3) {
     confidence -= 12;
     flags.push(`Thin comparables: only ${n} live-token protocol${n === 1 ? '' : 's'} in this category.`);
+  } else if (spread !== null && spread > 5) {
+    flags.push('Mixed comparables: this category\'s live mcap/TVL ratios span more than 5x, so the scenarios are wide.');
   }
-  return { implied, low, high, confidence, flags, multiple, median, n, growthPct, growthMult, maturityMult, reachMult, age };
+  // A weak TVL proxy is a warning, not a confidence deduction: the data is
+  // complete, but the model's premise (TVL as value a token could capture)
+  // is weaker for this row. The implied value is an upper bound.
+  if (isWeakProxy(protocol)) {
+    flags.push('TVL is mostly client capital under management or advice here: a future token would capture fee share, not the TVL itself. Treat the implied value as an upper bound.');
+  }
+  return { implied, low, high, base: baseImplied, plain: plainImplied, confidence, flags, multiple, median, n, growthPct, growthMult, maturityMult, reachMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -450,10 +496,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     symbol: item.p.symbol,
     token_status: 'pre-token',
     on_watchlist: watchlist.has(item.p.slug),
+    weak_proxy: isWeakProxy(item.p),
     age_days: item.s.age,
     implied_value_usd: item.s.implied,
     implied_low_usd: item.s.low,
     implied_high_usd: item.s.high,
+    implied_base_usd: item.s.base,
+    implied_plain_usd: item.s.plain,
     confidence: item.s.confidence,
     flags: item.s.flags,
     model: {
@@ -649,9 +698,12 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     on_watchlist: row.on_watchlist,
+    weak_proxy: row.weak_proxy,
     implied_value_usd: row.implied_value_usd,
     implied_low_usd: row.implied_low_usd,
     implied_high_usd: row.implied_high_usd,
+    implied_base_usd: row.implied_base_usd,
+    implied_plain_usd: row.implied_plain_usd,
     confidence: row.confidence,
     flags: row.flags,
     multiple: row.model.multiple,
